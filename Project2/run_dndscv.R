@@ -8,17 +8,17 @@ message("dndscv version: ", packageVersion("dndscv"))
 # read the mutation data
 maf_file <- "Team_4_STAD/TCGA.STAD.mutations.txt"
 maf <- read.table(maf_file,
-                  header=TRUE, sep="\t", quote="",
-                  stringsAsFactors=FALSE, comment.char="")
+                    header=TRUE, sep="\t", quote="",
+                    stringsAsFactors=FALSE, comment.char="")
 
 mutations <- data.frame(
-  sampleID = maf$patient_id,
-  chr      = maf$Chromosome,
-  pos      = maf$Start_Position,
-  ref      = maf$Reference_Allele,
-  alt      = maf$Tumor_Seq_Allele2,
-  geneName = maf$Hugo_Symbol,
-  stringsAsFactors = FALSE
+    sampleID = maf$patient_id,
+    chr      = maf$Chromosome,
+    pos      = maf$Start_Position,
+    ref      = maf$Reference_Allele,
+    alt      = maf$Tumor_Seq_Allele2,
+    geneName = maf$Hugo_Symbol,
+    stringsAsFactors = FALSE
 )
 mutations <- na.omit(mutations)
 

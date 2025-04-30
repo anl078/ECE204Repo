@@ -4,8 +4,8 @@ message("R version: ", R.version.string)
 if (!requireNamespace("BiocManager", quietly=TRUE))
     install.packages("BiocManager", repos="https://cloud.r-project.org")
 
-BiocManager::install(c("Rsamtools","BiocParallel"), 
-                     update = TRUE, ask = FALSE)
+BiocManager::install(c("Rsamtools","BiocParallel"),
+                    update = TRUE, ask = FALSE)
 
 if ("dndscv" %in% installed.packages()) remove.packages("dndscv")
 
