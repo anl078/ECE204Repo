@@ -1,0 +1,319 @@
+---
+title: An R Markdown document converted from "Project2_R_Abid.ipynb"
+output: html_document
+---
+
+```{r}
+library("dndscv")
+library(dplyr)
+library("biomaRt")
+library(MASS) 
+library(ggplot2)
+library(lmtest)
+library(stringr)
+library(VennDiagram)
+library(readr)
+library(gridExtra)
+library(RColorBrewer)
+library(glue)
+library(tidyr)
+library(mclust)
+```
+
+# STAU mutation
+
+```{r}
+STAD_mutation = read_tsv("Team_4_STAD/TCGA.STAD.mutations.txt", quote="\"")
+```
+
+```{r}
+nrow(STAD_mutation)
+```
+
+# make oncoDriveFML input
+
+```{r}
+oncoDriveFML <- STAD_mutation[STAD_mutation$VARIANT_CLASS == "SNV",]
+```
+
+```{r}
+colnames(oncoDriveFML)
+```
+
+```{r}
+oncoDrive_input = oncoDriveFML[, c("Chromosome", "Start_Position", "Reference_Allele", "Tumor_Seq_Allele2", "patient_id")]
+```
+
+```{r}
+colnames(oncoDrive_input) <- c("CHROMOSOME", "POSITION", "REF", "ALT", "SAMPLE")
+```
+
+```{r}
+# write.table(oncoDrive_input, file='oncoDriveFML.tsv', sep='\t', quote=FALSE, row.names=FALSE)
+```
+
+# Make CBASE Input
+
+```{r}
+seqs <- c(
+  "AAAAA", "AAAAC", "AAAAG", "AAAAT", "AAACA", "AAACC", "AAACG", "AAACT",
+  "AAAGA", "AAAGC", "AAAGG", "AAAGT", "AAATA", "AAATC", "AAATG", "AAATT",
+  "AACAA", "AACAC", "AACAG", "AACAT", "AACCA", "AACCC", "AACCG", "AACCT",
+  "AACGA", "AACGC", "AACGG", "AACGT", "AACTA", "AACTC", "AACTG", "AACTT",
+  "AAGAA", "AAGAC", "AAGAG", "AAGAT", "AAGCA", "AAGCC", "AAGCG", "AAGCT",
+  "AAGGA", "AAGGC", "AAGGG", "AAGGT", "AAGTA", "AAGTC", "AAGTG", "AAGTT",
+  "AATAA", "AATAC", "AATAG", "AATAT", "AATCA", "AATCC", "AATCG", "AATCT",
+  "AATGA", "AATGC", "AATGG", "AATGT", "AATTA", "AATTC", "AATTG", "AATTT"
+)
+
+keys <- substr(seqs, 3, 5)
+values <- 0:(length(seqs) - 1)
+context_dict <- setNames(values, keys)
+```
+
+```{r}
+context_dict
+```
+
+```{r}
+cbase_input = STAD_mutation %>% filter(VARIANT_CLASS == "SNV")
+cbase_input = cbase_input %>% dplyr::select(c(patient_id, Hugo_Symbol, Chromosome,
+                                       Start_Position, Reference_Allele, Tumor_Seq_Allele2,
+                                       Variant_Classification, CONTEXT))
+cbase_input <- cbase_input %>%
+  mutate(
+    context = substr(CONTEXT, 2, 4),
+    # context = substr(CONTEXT, (nchar(CONTEXT) - 4) %/% 2 + 1, (nchar(CONTEXT) - 4) %/% 2 + 5),
+    index = context_dict[context]
+  )
+
+cbase_input = cbase_input %>% filter(Variant_Classification != "3'Flank") %>% filter(Variant_Classification != "5'Flank")
+cbase_input <- cbase_input %>%
+  mutate(annotate = case_when(
+    Variant_Classification == "Missense_Mutation" ~ "missense",
+    Variant_Classification == "Nonsense_Mutation" ~ "nonsense",
+    Variant_Classification == "Silent" ~ "coding-synon",
+    Variant_Classification == "3'UTR" ~ "utr-3",
+    Variant_Classification == "5'UTR" ~ "utr-5"
+  ))
+
+cbase_input = cbase_input %>% dplyr::select(c(Hugo_Symbol, annotate, Tumor_Seq_Allele2, context))
+colnames(cbase_input) <- c("Gene", "mut_eff", "mut_nuc", "context")
+# write.table(cbase_input, file='cbase_input.tsv', sep='\t', quote=FALSE, row.names=FALSE)
+```
+
+## Filter out patients with too many mutations and genes with too many mutations
+
+```{r}
+patient_mut = 7000
+gene_mut = 300
+```
+
+```{r}
+sample_mutation_counts <- table(STAD_mutation$patient_id)
+gene_mutation_counts <- table(STAD_mutation$Hugo_Symbol)
+
+# Filter hypermutated patients
+print(nrow(STAD_mutation))
+print(length(sample_mutation_counts))
+hypermutators_patient <- names((sample_mutation_counts[(sample_mutation_counts > patient_mut) | (sample_mutation_counts <= 10)]))
+print(length(hypermutators_patient))
+STAD_mutation_filtered_patient <- STAD_mutation %>% filter(!patient_id %in% hypermutators_patient)
+print(nrow(STAD_mutation_filtered_patient))
+
+sample_mutation_counts_filtered_patient <- table(STAD_mutation_filtered_patient$patient_id)
+gene_mutation_counts_filtered_patient <- table(STAD_mutation_filtered_patient$Hugo_Symbol)
+
+# Filter out hyptermutated genes
+gene_mutation_counts <- table(STAD_mutation$Hugo_Symbol)
+print(length(gene_mutation_counts))
+hypermutators_gene <- names((gene_mutation_counts[(gene_mutation_counts > gene_mut)]))
+print(length(hypermutators_gene))
+STAD_mutation_filtered_patient_gene <- STAD_mutation_filtered_patient %>% filter(!Hugo_Symbol %in% hypermutators_gene)
+print(nrow(STAD_mutation_filtered_patient_gene))
+
+sample_mutation_counts_filtered_patient_gene <- table(STAD_mutation_filtered_patient_gene$patient_id)
+gene_mutation_counts_filtered_patient_gene <- table(STAD_mutation_filtered_patient_gene$Hugo_Symbol)
+
+# Function to compute summary statistics for mutation counts
+summarize_mutation_counts <- function(counts, label) {
+  stats <- data.frame(
+    Mean = mean(counts),
+    Median = median(counts),
+    Variance = var(counts),
+    Max = max(counts),
+    Dispersion = var(counts) / mean(counts),
+    CV = sd(counts) / mean(counts)
+  )
+}
+
+stats_before <- summarize_mutation_counts(sample_mutation_counts, "Patients (Before Filtering)")
+stats_after_patient <- summarize_mutation_counts(sample_mutation_counts_filtered_patient, "Patients (After Patient Filtering)")
+stats_after_both <- summarize_mutation_counts(sample_mutation_counts_filtered_patient_gene, "Patients (After Patient and Gene Filtering)")
+
+stats_gene_before <- summarize_mutation_counts(gene_mutation_counts, "Genes (Before Filtering)")
+stats_gene_after_patient <- summarize_mutation_counts(gene_mutation_counts_filtered_patient, "Genes (After Patient Filtering)")
+stats_gene_after_both <- summarize_mutation_counts(gene_mutation_counts_filtered_patient_gene, "Genes (After Patient and Gene Filtering)")
+```
+
+## Filter for mutations that pass
+
+```{r}
+STAD_mutation_filtered_pass <- STAD_mutation_filtered_patient_gene %>% filter(FILTER == "PASS")
+nrow(STAD_mutation_filtered_pass)
+```
+
+### keep only SNV
+
+```{r}
+# STAD_mutation_filtered_pass <- STAD_mutation_filtered_pass[STAD_mutation_filtered_pass$Variant_Type == "SNP",]
+STAD_mutation_filtered_pass <- STAD_mutation_filtered_pass[STAD_mutation_filtered_pass$VARIANT_CLASS == "SNV",]
+nrow(STAD_mutation_filtered_pass)
+
+```
+
+```{r}
+sample_mutation_counts_filtered_final <- table(STAD_mutation_filtered_pass$patient_id)
+gene_mutation_counts_filtered_final <- table(STAD_mutation_filtered_pass$Hugo_Symbol)
+```
+
+```{r}
+plot_data_patient <- data.frame(
+  Counts = c(sample_mutation_counts, sample_mutation_counts_filtered_patient, sample_mutation_counts_filtered_patient_gene, sample_mutation_counts_filtered_final),
+  Stage = factor(
+    rep(c("Before Filtering", "After Patient Filtering", "After Patient and Gene Filtering", "After SNP Filtering"),
+        times = c(length(sample_mutation_counts), length(sample_mutation_counts_filtered_patient), length(sample_mutation_counts_filtered_patient_gene), length(sample_mutation_counts_filtered_final))),
+    levels = c("Before Filtering", "After Patient Filtering", "After Patient and Gene Filtering", "After SNP Filtering")
+  )
+)
+
+plot_data_gene <- data.frame(
+  Counts = c(gene_mutation_counts, gene_mutation_counts_filtered_patient, gene_mutation_counts_filtered_patient_gene, gene_mutation_counts_filtered_final),
+  Stage = factor(
+    rep(c("Before Filtering", "After Patient Filtering", "After Patient and Gene Filtering", "After SNP Filtering"),
+        times = c(length(gene_mutation_counts), length(gene_mutation_counts_filtered_patient), length(gene_mutation_counts_filtered_patient_gene), length(gene_mutation_counts_filtered_final))),
+    levels = c("Before Filtering", "After Patient Filtering", "After Patient and Gene Filtering", "After SNP Filtering")
+  )
+)
+
+colors <- brewer.pal(4, "Set2")
+
+# Histogram for mutation counts per patient
+p1 <- ggplot(plot_data_patient, aes(x = Counts, fill = Stage)) +
+  geom_histogram(binwidth = 0.1, alpha = 0.7) +
+  facet_wrap(~ Stage, ncol = 1, scales = "free_y") +
+  scale_x_log10(breaks = c(1, 10, 100, 1000, 10000), labels = scales::comma) +
+  scale_fill_manual(values = colors) +
+  labs(
+    title = "Mutation Counts per Patient",
+    subtitle = glue("Filtering out: Patients > {patient_mut} mutations, Genes > {gene_mut} mutations"),
+    x = "Mutation Count (log scale)",
+    y = "Frequency"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "none", 
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(size = 10),
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(size = 10, face = "bold")
+  )
+
+# Histogram for mutation counts per gene 
+p2 <- ggplot(plot_data_gene, aes(x = Counts, fill = Stage)) +
+  geom_histogram(binwidth = 0.1, alpha = 0.7) +
+  facet_wrap(~ Stage, ncol = 1, scales = "free_y") +
+  scale_x_log10(breaks = c(1, 10, 100, 1000, 10000), labels = scales::comma) +
+  scale_fill_manual(values = colors) +
+  labs(
+    title = "Mutation Counts per Gene",
+    subtitle = glue("Filtering out: Patients > {patient_mut} mutations, Genes > {gene_mut} mutations"),
+    x = "Mutation Count (log scale)",
+    y = "Frequency"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(size = 10),
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(size = 10, face = "bold")
+  )
+
+```
+
+```{r}
+print(p1)
+```
+
+```{r}
+print(p2)
+```
+
+#Split & Filter Bi-Modally
+
+##Z score threshold
+```{r}
+z_thresh = 2 # is absolute threshold for + and -
+```
+
+```{r}
+
+STAD_mutation_bimodal = STAD_mutation %>% filter(VARIANT_CLASS == "SNV")
+patient_mut_data = STAD_mutation_bimodal %>%
+  group_by(patient_id) %>%
+  summarize(num_mutations = n()) %>%
+  ungroup() %>%
+  filter(num_mutations > 0) %>%
+  mutate(log10_mutations = log10(num_mutations))
+
+gmm_model = Mclust(patient_mut_data$log10_mutations, G = 2)
+patient_mut_data$gmm_cluster = as.factor(gmm_model$classification)
+patient_mut_data = patient_mut_data %>% 
+  group_by(gmm_cluster) %>% mutate(gmm_z_score = scale(log10_mutations))
+z_lines = patient_mut_data %>%
+  group_by(gmm_cluster) %>%
+  summarize(
+    log10_center = mean(log10_mutations),
+    log10_sd = sd(log10_mutations)
+  ) %>%
+  mutate(
+    lower_thresh = 10^(log10_center - z_thresh * log10_sd),
+    upper_thresh = 10^(log10_center + z_thresh * log10_sd)
+  )
+
+g = ggplot(patient_mut_data, aes(x = num_mutations, fill = gmm_cluster)) +
+  geom_histogram(bins = 50, color = "black", position = "identity", alpha = 0.6) +
+  scale_x_log10() +
+  labs(
+    x = "Number of Mutations (log10 scale)",
+    y = "Number of Patients",
+    fill = "GMM Cluster",
+    title = paste("Mutation Distribution with ±", z_thresh, " Z-Score Thresholds")
+  ) +
+  theme_minimal()
+
+# Add vertical dashed lines
+colors = scales::hue_pal()(length(unique(patient_mut_data$gmm_cluster)))
+for (i in 1:nrow(z_lines)) {
+  g = g +
+    geom_vline(xintercept = z_lines$lower_thresh[i], linetype = "dashed", linewidth = 1.1, color = colors[i]) +
+    geom_vline(xintercept = z_lines$upper_thresh[i], linetype = "dashed", linewidth = 1.1, color = colors[i])
+}
+
+print(g)
+```
+
+```{r}
+patient_mut_data_filter = patient_mut_data %>% filter(abs(gmm_z_score) < 2)
+patient_mut_data_filter_gmm_1 = patient_mut_data_filter %>% filter(gmm_cluster == 1)
+patient_mut_data_filter_gmm_2 = patient_mut_data_filter %>% filter(gmm_cluster == 2)
+
+STAD_mutation_bimodal_gmm_1 = STAD_mutation_bimodal %>% filter(patient_id %in% patient_mut_data_filter_gmm_1$patient_id)
+
+STAD_mutation_bimodal_gmm_2 = STAD_mutation_bimodal %>% filter(patient_id %in% patient_mut_data_filter_gmm_2$patient_id)
+
+write.table(STAD_mutation_bimodal_gmm_1, file = "STAD_mutation_gmm_1.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+write.table(STAD_mutation_bimodal_gmm_2, file = "STAD_mutation_gmm_2.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+```
+
