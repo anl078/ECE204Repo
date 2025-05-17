@@ -1,0 +1,11 @@
+De novo extracted, Global NMF Signatures, L1 Error %, L2 Error %, KL Divergence, Cosine Similarity, Correlation
+Signature 96-A, Signature SBS1 (68.68%) & Signature SBS5 (31.32%), 29.20,  10.82, 0.149, 0.99, 0.99
+Signature 96-B, Signature SBS1 (25.44%) & Signature SBS5 (26.04%) & Signature SBS44 (48.52%), 28.49,  17.49, 0.101, 0.98, 0.98
+Signature 96-C, Signature SBS1 (28.36%) & Signature SBS5 (32.50%) & Signature SBS44 (39.14%), 41.01,  25.82, 0.198, 0.97, 0.96
+Signature 96-D, Signature SBS1 (11.38%) & Signature SBS5 (24.64%) & Signature SBS21 (63.98%), 28.03,  19.63, 0.096, 0.98, 0.98
+Signature 96-E, Signature SBS1 (14.82%) & Signature SBS5 (0.64%) & Signature SBS20 (19.22%) & Signature SBS26 (38.18%) & Signature SBS54 (27.14%), 29.36,  22.58, 0.108, 0.97, 0.97
+Signature 96-F, Signature SBS5 (17.22%) & Signature SBS15 (82.78%), 42.26,  17.31, 0.242, 0.98, 0.98
+Signature 96-G, Signature SBS5 (14.72%) & Signature SBS10a (21.24%) & Signature SBS10b (33.40%) & Signature SBS15 (13.50%) & Signature SBS28 (17.14%), 23.35,  14.86, 0.132, 0.99, 0.99
+Signature 96-H, Signature SBS1 (4.76%) & Signature SBS5 (3.16%) & Signature SBS12 (37.18%) & Signature SBS42 (31.40%) & Signature SBS44 (23.50%), 46.19,  46.68, 0.315, 0.88, 0.82
+Signature 96-I, Signature SBS5 (17.12%) & Signature SBS17a (26.26%) & Signature SBS17b (56.62%), 24.94,  9.97, 0.084, 1.00, 0.99
+Signature 96-J, Signature SBS1 (9.02%) & Signature SBS2 (7.58%) & Signature SBS3 (75.74%) & Signature SBS13 (7.66%), 42.18,  41.36, 0.168, 0.91, 0.79
