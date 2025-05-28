@@ -1,0 +1,2001 @@
+---
+title: An R Markdown document converted from "Project2_R_Abid.ipynb"
+output: html_document
+---
+
+```{r}
+library("dndscv")
+library(dplyr)
+library("biomaRt")
+library(MASS) 
+library(ggplot2)
+library(lmtest)
+library(stringr)
+library(VennDiagram)
+library(readr)
+library(gridExtra)
+library(RColorBrewer)
+library(glue)
+library(tidyr)
+library(mclust)
+```
+
+# STAU mutation
+
+```{r}
+STAD_mutation = read_tsv("Team_4_STAD/TCGA.STAD.mutations.txt", quote="\"")
+```
+
+```{r}
+nrow(STAD_mutation)
+```
+
+# make oncoDriveFML input
+
+```{r}
+oncoDriveFML <- STAD_mutation[STAD_mutation$VARIANT_CLASS == "SNV",]
+```
+
+```{r}
+colnames(oncoDriveFML)
+```
+
+```{r}
+oncoDrive_input = oncoDriveFML[, c("Chromosome", "Start_Position", "Reference_Allele", "Tumor_Seq_Allele2", "patient_id")]
+```
+
+```{r}
+colnames(oncoDrive_input) <- c("CHROMOSOME", "POSITION", "REF", "ALT", "SAMPLE")
+```
+
+```{r}
+# write.table(oncoDrive_input, file='oncoDriveFML.tsv', sep='\t', quote=FALSE, row.names=FALSE)
+```
+
+# Make CBASE Input
+
+```{r}
+seqs <- c(
+  "AAAAA", "AAAAC", "AAAAG", "AAAAT", "AAACA", "AAACC", "AAACG", "AAACT",
+  "AAAGA", "AAAGC", "AAAGG", "AAAGT", "AAATA", "AAATC", "AAATG", "AAATT",
+  "AACAA", "AACAC", "AACAG", "AACAT", "AACCA", "AACCC", "AACCG", "AACCT",
+  "AACGA", "AACGC", "AACGG", "AACGT", "AACTA", "AACTC", "AACTG", "AACTT",
+  "AAGAA", "AAGAC", "AAGAG", "AAGAT", "AAGCA", "AAGCC", "AAGCG", "AAGCT",
+  "AAGGA", "AAGGC", "AAGGG", "AAGGT", "AAGTA", "AAGTC", "AAGTG", "AAGTT",
+  "AATAA", "AATAC", "AATAG", "AATAT", "AATCA", "AATCC", "AATCG", "AATCT",
+  "AATGA", "AATGC", "AATGG", "AATGT", "AATTA", "AATTC", "AATTG", "AATTT"
+)
+
+keys <- substr(seqs, 3, 5)
+values <- 0:(length(seqs) - 1)
+context_dict <- setNames(values, keys)
+```
+
+```{r}
+context_dict
+```
+
+```{r}
+cbase_input = STAD_mutation %>% filter(VARIANT_CLASS == "SNV")
+cbase_input = cbase_input %>% dplyr::select(c(patient_id, Hugo_Symbol, Chromosome,
+                                       Start_Position, Reference_Allele, Tumor_Seq_Allele2,
+                                       Variant_Classification, CONTEXT))
+cbase_input <- cbase_input %>%
+  mutate(
+    context = substr(CONTEXT, 2, 4),
+    # context = substr(CONTEXT, (nchar(CONTEXT) - 4) %/% 2 + 1, (nchar(CONTEXT) - 4) %/% 2 + 5),
+    index = context_dict[context]
+  )
+
+cbase_input = cbase_input %>% filter(Variant_Classification != "3'Flank") %>% filter(Variant_Classification != "5'Flank")
+cbase_input <- cbase_input %>%
+  mutate(annotate = case_when(
+    Variant_Classification == "Missense_Mutation" ~ "missense",
+    Variant_Classification == "Nonsense_Mutation" ~ "nonsense",
+    Variant_Classification == "Silent" ~ "coding-synon",
+    Variant_Classification == "3'UTR" ~ "utr-3",
+    Variant_Classification == "5'UTR" ~ "utr-5"
+  ))
+
+cbase_input = cbase_input %>% dplyr::select(c(Hugo_Symbol, annotate, Tumor_Seq_Allele2, context))
+colnames(cbase_input) <- c("Gene", "mut_eff", "mut_nuc", "context")
+# write.table(cbase_input, file='cbase_input.tsv', sep='\t', quote=FALSE, row.names=FALSE)
+```
+
+## Filter out patients with too many mutations and genes with too many mutations
+
+```{r}
+patient_mut = 7000
+gene_mut = 300
+```
+
+```{r}
+sample_mutation_counts <- table(STAD_mutation$patient_id)
+gene_mutation_counts <- table(STAD_mutation$Hugo_Symbol)
+
+# Filter hypermutated patients
+print(nrow(STAD_mutation))
+print(length(sample_mutation_counts))
+hypermutators_patient <- names((sample_mutation_counts[(sample_mutation_counts > patient_mut) | (sample_mutation_counts <= 10)]))
+print(length(hypermutators_patient))
+STAD_mutation_filtered_patient <- STAD_mutation %>% filter(!patient_id %in% hypermutators_patient)
+print(nrow(STAD_mutation_filtered_patient))
+
+sample_mutation_counts_filtered_patient <- table(STAD_mutation_filtered_patient$patient_id)
+gene_mutation_counts_filtered_patient <- table(STAD_mutation_filtered_patient$Hugo_Symbol)
+
+# Filter out hyptermutated genes
+gene_mutation_counts <- table(STAD_mutation$Hugo_Symbol)
+print(length(gene_mutation_counts))
+hypermutators_gene <- names((gene_mutation_counts[(gene_mutation_counts > gene_mut)]))
+print(length(hypermutators_gene))
+STAD_mutation_filtered_patient_gene <- STAD_mutation_filtered_patient %>% filter(!Hugo_Symbol %in% hypermutators_gene)
+print(nrow(STAD_mutation_filtered_patient_gene))
+
+sample_mutation_counts_filtered_patient_gene <- table(STAD_mutation_filtered_patient_gene$patient_id)
+gene_mutation_counts_filtered_patient_gene <- table(STAD_mutation_filtered_patient_gene$Hugo_Symbol)
+
+# Function to compute summary statistics for mutation counts
+summarize_mutation_counts <- function(counts, label) {
+  stats <- data.frame(
+    Mean = mean(counts),
+    Median = median(counts),
+    Variance = var(counts),
+    Max = max(counts),
+    Dispersion = var(counts) / mean(counts),
+    CV = sd(counts) / mean(counts)
+  )
+}
+
+stats_before <- summarize_mutation_counts(sample_mutation_counts, "Patients (Before Filtering)")
+stats_after_patient <- summarize_mutation_counts(sample_mutation_counts_filtered_patient, "Patients (After Patient Filtering)")
+stats_after_both <- summarize_mutation_counts(sample_mutation_counts_filtered_patient_gene, "Patients (After Patient and Gene Filtering)")
+
+stats_gene_before <- summarize_mutation_counts(gene_mutation_counts, "Genes (Before Filtering)")
+stats_gene_after_patient <- summarize_mutation_counts(gene_mutation_counts_filtered_patient, "Genes (After Patient Filtering)")
+stats_gene_after_both <- summarize_mutation_counts(gene_mutation_counts_filtered_patient_gene, "Genes (After Patient and Gene Filtering)")
+```
+
+## Filter for mutations that pass
+
+```{r}
+STAD_mutation_filtered_pass <- STAD_mutation_filtered_patient_gene %>% filter(FILTER == "PASS")
+nrow(STAD_mutation_filtered_pass)
+```
+
+### keep only SNV
+
+```{r}
+# STAD_mutation_filtered_pass <- STAD_mutation_filtered_pass[STAD_mutation_filtered_pass$Variant_Type == "SNP",]
+STAD_mutation_filtered_pass <- STAD_mutation_filtered_pass[STAD_mutation_filtered_pass$VARIANT_CLASS == "SNV",]
+nrow(STAD_mutation_filtered_pass)
+
+```
+
+```{r}
+sample_mutation_counts_filtered_final <- table(STAD_mutation_filtered_pass$patient_id)
+gene_mutation_counts_filtered_final <- table(STAD_mutation_filtered_pass$Hugo_Symbol)
+```
+
+```{r}
+plot_data_patient <- data.frame(
+  Counts = c(sample_mutation_counts, sample_mutation_counts_filtered_patient, sample_mutation_counts_filtered_patient_gene, sample_mutation_counts_filtered_final),
+  Stage = factor(
+    rep(c("Before Filtering", "After Patient Filtering", "After Patient and Gene Filtering", "After SNP Filtering"),
+        times = c(length(sample_mutation_counts), length(sample_mutation_counts_filtered_patient), length(sample_mutation_counts_filtered_patient_gene), length(sample_mutation_counts_filtered_final))),
+    levels = c("Before Filtering", "After Patient Filtering", "After Patient and Gene Filtering", "After SNP Filtering")
+  )
+)
+
+plot_data_gene <- data.frame(
+  Counts = c(gene_mutation_counts, gene_mutation_counts_filtered_patient, gene_mutation_counts_filtered_patient_gene, gene_mutation_counts_filtered_final),
+  Stage = factor(
+    rep(c("Before Filtering", "After Patient Filtering", "After Patient and Gene Filtering", "After SNP Filtering"),
+        times = c(length(gene_mutation_counts), length(gene_mutation_counts_filtered_patient), length(gene_mutation_counts_filtered_patient_gene), length(gene_mutation_counts_filtered_final))),
+    levels = c("Before Filtering", "After Patient Filtering", "After Patient and Gene Filtering", "After SNP Filtering")
+  )
+)
+
+colors <- brewer.pal(4, "Set2")
+
+# Histogram for mutation counts per patient
+p1 <- ggplot(plot_data_patient, aes(x = Counts, fill = Stage)) +
+  geom_histogram(binwidth = 0.1, alpha = 0.7) +
+  facet_wrap(~ Stage, ncol = 1, scales = "free_y") +
+  scale_x_log10(breaks = c(1, 10, 100, 1000, 10000), labels = scales::comma) +
+  scale_fill_manual(values = colors) +
+  labs(
+    title = "Mutation Counts per Patient",
+    subtitle = glue("Filtering out: Patients > {patient_mut} mutations, Genes > {gene_mut} mutations"),
+    x = "Mutation Count (log scale)",
+    y = "Frequency"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "none", 
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(size = 10),
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(size = 10, face = "bold")
+  )
+
+# Histogram for mutation counts per gene 
+p2 <- ggplot(plot_data_gene, aes(x = Counts, fill = Stage)) +
+  geom_histogram(binwidth = 0.1, alpha = 0.7) +
+  facet_wrap(~ Stage, ncol = 1, scales = "free_y") +
+  scale_x_log10(breaks = c(1, 10, 100, 1000, 10000), labels = scales::comma) +
+  scale_fill_manual(values = colors) +
+  labs(
+    title = "Mutation Counts per Gene",
+    subtitle = glue("Filtering out: Patients > {patient_mut} mutations, Genes > {gene_mut} mutations"),
+    x = "Mutation Count (log scale)",
+    y = "Frequency"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(size = 10),
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(size = 10, face = "bold")
+  )
+
+```
+
+```{r}
+print(p1)
+```
+
+```{r}
+print(p2)
+```
+
+#Split & Filter Bi-Modally
+
+##Z score threshold
+```{r}
+z_thresh = 2 # is absolute threshold for + and -
+```
+
+```{r}
+
+STAD_mutation_bimodal = STAD_mutation %>% filter(VARIANT_CLASS == "SNV")
+patient_mut_data = STAD_mutation_bimodal %>%
+  group_by(patient_id) %>%
+  summarize(num_mutations = n()) %>%
+  ungroup() %>%
+  filter(num_mutations > 0) %>%
+  mutate(log10_mutations = log10(num_mutations))
+
+gmm_model = Mclust(patient_mut_data$log10_mutations, G = 2)
+patient_mut_data$gmm_cluster = as.factor(gmm_model$classification)
+patient_mut_data = patient_mut_data %>% 
+  group_by(gmm_cluster) %>% mutate(gmm_z_score = scale(log10_mutations))
+z_lines = patient_mut_data %>%
+  group_by(gmm_cluster) %>%
+  summarize(
+    log10_center = mean(log10_mutations),
+    log10_sd = sd(log10_mutations)
+  ) %>%
+  mutate(
+    lower_thresh = 10^(log10_center - z_thresh * log10_sd),
+    upper_thresh = 10^(log10_center + z_thresh * log10_sd)
+  )
+
+g = ggplot(patient_mut_data, aes(x = num_mutations, fill = gmm_cluster)) +
+  geom_histogram(bins = 50, color = "black", position = "identity", alpha = 0.6) +
+  scale_x_log10() +
+  labs(
+    x = "Number of Mutations (log10 scale)",
+    y = "Number of Patients",
+    fill = "GMM Cluster",
+    title = paste("Mutation Distribution with ±", z_thresh, " Z-Score Thresholds")
+  ) +
+  theme_minimal()
+
+# Add vertical dashed lines
+colors = scales::hue_pal()(length(unique(patient_mut_data$gmm_cluster)))
+for (i in 1:nrow(z_lines)) {
+  g = g +
+    geom_vline(xintercept = z_lines$lower_thresh[i], linetype = "dashed", linewidth = 1.1, color = colors[i]) +
+    geom_vline(xintercept = z_lines$upper_thresh[i], linetype = "dashed", linewidth = 1.1, color = colors[i])
+}
+
+print(g)
+```
+
+```{r}
+patient_mut_data_filter = patient_mut_data %>% filter(abs(gmm_z_score) < 2)
+patient_mut_data_filter_gmm_1 = patient_mut_data_filter %>% filter(gmm_cluster == 1)
+patient_mut_data_filter_gmm_2 = patient_mut_data_filter %>% filter(gmm_cluster == 2)
+
+STAD_mutation_bimodal_gmm_1 = STAD_mutation_bimodal %>% filter(patient_id %in% patient_mut_data_filter_gmm_1$patient_id)
+
+STAD_mutation_bimodal_gmm_2 = STAD_mutation_bimodal %>% filter(patient_id %in% patient_mut_data_filter_gmm_2$patient_id)
+
+write.table(STAD_mutation_bimodal_gmm_1, file = "STAD_mutation_gmm_1.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+write.table(STAD_mutation_bimodal_gmm_2, file = "STAD_mutation_gmm_2.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+```
+
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(rstatix)
+library(purrr)
+
+# Separate continuous and categorical variables
+cont_vars = metadata %>%
+  dplyr::select(-gmm_cluster) %>%
+  dplyr::select(where(is.numeric)) %>%
+  names()
+
+cat_vars = metadata %>%
+  dplyr::select(-gmm_cluster) %>%
+  dplyr::select(where(~ !is.numeric(.))) %>%
+  names()
+
+# Wilcoxon rank-sum tests for continuous variables
+wilcox_results = map_dfr(cont_vars, function(var){
+  df = metadata %>%
+    dplyr::select(gmm_cluster, !!sym(var)) %>%
+    filter(!is.na(!!sym(var))) %>%
+    rename(value = !!sym(var))
+  
+  res = wilcox_test(df, value ~ gmm_cluster) %>%
+    adjust_pvalue(method = "BH") %>%
+    add_significance() %>%
+    mutate(variable = var, test = "Wilcoxon")
+  
+  return(res)
+})
+
+# Fisher's exact test for categorical variables
+fisher_results = map_dfr(cat_vars, function(var){
+  df = metadata %>%
+    dplyr::select(gmm_cluster, !!sym(var)) %>%
+    filter(!is.na(!!sym(var))) %>%
+    rename(value = !!sym(var))
+  
+  res = fisher_test(df, gmm_cluster ~ value) %>%
+    adjust_pvalue(method = "BH") %>%
+    add_significance() %>%
+    mutate(variable = var, test = "Fisher exact")
+  
+  return(res)
+})
+
+# Combine results
+all_results = bind_rows(wilcox_results, fisher_results) %>%
+  dplyr::select(variable, test, statistic, p, p.adj, p.adj.signif)
+
+# View
+all_results
+
+```
+```{r}
+library(dplyr)
+library(rstatix)
+library(purrr)
+
+exclude_vars = c("gmm_cluster", "patient_id")
+
+cat_vars = metadata %>%
+  dplyr::select(-all_of(exclude_vars)) %>%
+  dplyr::select(where(~ !is.numeric(.))) %>%
+  names()
+
+fisher_results = purrr::map_dfr(cat_vars, function(var){
+  df = metadata %>%
+    dplyr::select(gmm_cluster, !!sym(var)) %>%
+    filter(!is.na(gmm_cluster), !is.na(!!sym(var))) %>%
+    mutate(across(everything(), as.factor)) %>%
+    rename(value = !!sym(var))
+  
+  # Filter out categories with fewer than 10 observations
+  value_counts = table(df$value)
+  valid_categories = names(value_counts[value_counts >= 10])
+  df_filtered = df %>% filter(value %in% valid_categories)
+  
+  contingency_table = table(df_filtered$gmm_cluster, df_filtered$value)
+  
+  fisher_test_result = tryCatch({
+    fisher_test(contingency_table) %>%
+      adjust_pvalue(method = "BH") %>%
+      add_significance() %>%
+      mutate(variable = var, test = "Fisher exact")
+  }, error = function(e) {
+    message(paste("Skipping variable:", var, "—", e$message))
+    return(NULL)
+  })
+  
+  return(fisher_test_result)
+})
+
+
+
+
+
+
+```
+
+
+```{r}
+library(dplyr)
+library(rstatix)
+library(purrr)
+
+exclude_vars = c("gmm_cluster", "patient_id")
+
+cat_vars = metadata %>%
+  dplyr::select(-all_of(exclude_vars)) %>%
+  dplyr::select(where(~ !is.numeric(.))) %>%
+  names()
+
+cont_vars = metadata %>%
+  dplyr::select(-all_of(exclude_vars)) %>%
+  dplyr::select(where(~ is.numeric(.))) %>%
+  names()
+
+fisher_results = purrr::map_dfr(cat_vars, function(var) {
+  df = metadata %>%
+    dplyr::select(gmm_cluster, !!sym(var)) %>%
+    filter(!is.na(gmm_cluster), !is.na(!!sym(var))) %>%
+    mutate(across(everything(), as.factor)) %>%
+    rename(value = !!sym(var))
+  
+  value_counts = table(df$value)
+  valid_categories = names(value_counts[value_counts >= 10])
+  df_filtered = df %>% filter(value %in% valid_categories)
+  
+  contingency_table = table(df_filtered$gmm_cluster, df_filtered$value)
+  
+  fisher_test_result = tryCatch({
+    fisher_test(contingency_table) %>%
+      adjust_pvalue(method = "BH") %>%
+      add_significance() %>%
+      mutate(variable = var, test = "Fisher exact")
+  }, error = function(e) {
+    message(paste("Skipping variable:", var, "—", e$message))
+    return(NULL)
+  })
+  
+  return(fisher_test_result)
+})
+
+wilcox_results = purrr::map_dfr(cont_vars, function(var) {
+  df = metadata %>%
+    dplyr::select(gmm_cluster, !!sym(var)) %>%
+    filter(!is.na(!!sym(var))) %>%
+    rename(value = !!sym(var))
+  
+  res = wilcox_test(df, value ~ gmm_cluster) %>%
+    adjust_pvalue(method = "BH") %>%
+    add_significance() %>%
+    mutate(variable = var, test = "Wilcoxon")
+  
+  return(res)
+})
+
+all_results = bind_rows(fisher_results, wilcox_results)
+
+all_results
+
+
+```
+
+```{r}
+metadata = read_tsv("Team_4_STAD/TCGA.STAD.metadata.txt", quote="\"")
+patient_mut_data_merge = patient_mut_data %>% left_join(metadata, by = "patient_id")
+
+g = ggplot(patient_mut_data_merge, aes(x = num_mutations, fill = gender)) +
+  geom_histogram(bins = 50, color = "black", position = "identity", alpha = 0.6) +
+  scale_x_log10() +
+  labs(
+    x = "Number of Mutations (log10 scale)",
+    y = "Number of Patients",
+    fill = "Sex",
+    title = paste("Mutation Distribution with ±", z_thresh, " Z-Score Thresholds")
+  ) +scale_fill_brewer(palette = "Set2") + 
+  theme_minimal()
+
+# Add vertical dashed lines
+colors = scales::hue_pal()(length(unique(patient_mut_data$gmm_cluster)))
+for (i in 1:nrow(z_lines)) {
+  g = g +
+    geom_vline(xintercept = z_lines$lower_thresh[i], linetype = "dashed", linewidth = 1.1, color = colors[i]) +
+    geom_vline(xintercept = z_lines$upper_thresh[i], linetype = "dashed", linewidth = 1.1, color = colors[i])
+}
+
+print(g)
+```
+
+```{r}
+g = ggplot(patient_mut_data_merge, aes(x = as.factor(gmm_cluster), y = age_at_initial_pathologic_diagnosis, fill = as.factor(gmm_cluster))) +
+  #geom_violin() + 
+  geom_boxplot(notch = TRUE, alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.3, color = "black") +
+  labs(
+    x = "GMM Cluster",
+    y = "Age at Diagnosis",
+    fill = "GMM Cluster",
+    title = "Age Distribution by GMM Cluster"
+  ) +
+  theme_minimal() + scale_fill_brewer(palette = "Set3") 
+print(g)
+
+```
+
+```{r}
+
+```
+
+
+
+# Mutated samples per gene
+
+```{r}
+mutation_summary <- STAD_mutation %>%
+  group_by(Hugo_Symbol) %>%
+  summarise(Samples_Mutated = n_distinct(patient_id)) %>%
+  ungroup() %>%
+  arrange(desc(Samples_Mutated)) %>%  
+  mutate(Hugo_Symbol = factor(Hugo_Symbol, levels = Hugo_Symbol)) 
+```
+
+```{r}
+mutation_summary <- STAD_mutation %>%
+  group_by(Hugo_Symbol) %>%
+  summarise(Samples_Mutated = n_distinct(patient_id)) %>%
+  ungroup() %>%
+  arrange(desc(Samples_Mutated)) %>%  
+  slice_head(n = 30) %>%
+  mutate(Hugo_Symbol = factor(Hugo_Symbol, levels = Hugo_Symbol)) 
+
+p <- ggplot(mutation_summary, aes(x = Hugo_Symbol, y = Samples_Mutated)) +
+  geom_bar(stat = "identity", fill = "skyblue", color = "black", width = 0.8) +
+  geom_text(aes(label = Samples_Mutated), vjust = -0.5, size = 3) +
+  labs(
+    title = "Before Filtering: Number of Patients with Mutations per Gene",
+    subtitle = "Top 30 genes by number of carrier patients",
+    x = "Genes",
+    y = "Patient Carriers"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(size = 10),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.major.x = element_blank(), 
+    panel.grid.minor = element_blank()
+  )
+
+print(p)
+```
+
+```{r}
+mutation_summary <- STAD_mutation_filtered_pass %>%
+  group_by(Hugo_Symbol) %>%
+  summarise(Samples_Mutated = n_distinct(patient_id)) %>%
+  ungroup() %>%
+  arrange(desc(Samples_Mutated)) %>% 
+  slice_head(n = 30) %>%
+  mutate(Hugo_Symbol = factor(Hugo_Symbol, levels = Hugo_Symbol))
+
+p <- ggplot(mutation_summary, aes(x = Hugo_Symbol, y = Samples_Mutated)) +
+  geom_bar(stat = "identity", fill = "skyblue", color = "black", width = 0.8) +
+  geom_text(aes(label = Samples_Mutated), vjust = -0.5, size = 3) +
+  labs(
+    title = "After Filtering: Number of Patients with Mutations per Gene",
+    subtitle = "Top 30 genes by number of carrier patients",
+    x = "Genes",
+    y = "Patient Carriers"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(size = 10),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.major.x = element_blank(), 
+    panel.grid.minor = element_blank()
+  )
+
+print(p)
+```
+
+# Variant callers
+
+```{r}
+callers <- STAD_mutation %>%
+  group_by(NCALLERS) %>%
+  summarise(Variant_Count = n()) %>%
+  ungroup() %>%
+  mutate(NCALLERS = factor(NCALLERS)) 
+
+p <- ggplot(callers, aes(x = NCALLERS, y = Variant_Count)) +
+  geom_bar(stat = "identity", fill = "skyblue", color = "black", width = 0.7) +
+  labs(
+    title = "Before Filtering: Variant Callers that Reported the Variant",
+    x = "Number of Variant Callers",
+    y = "Variant Count"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    plot.title = element_text(size = 12, face = "bold"),
+    axis.title.x = element_text(size = 10),
+    axis.title.y = element_text(size = 10),
+    panel.grid.major.x = element_blank(),  # Remove x-axis grid lines
+    panel.grid.minor = element_blank()
+  )
+
+p
+```
+
+```{r}
+callers <- STAD_mutation_filtered_pass %>%
+  group_by(NCALLERS) %>%
+  summarise(Variant_Count = n()) %>%
+  ungroup() %>%
+  mutate(NCALLERS = factor(NCALLERS)) 
+
+p <- ggplot(callers, aes(x = NCALLERS, y = Variant_Count)) +
+  geom_bar(stat = "identity", fill = "skyblue", color = "black", width = 0.7) +
+  labs(
+    title = "After Filtering: Variant Callers that Reported the Variant",
+    x = "Number of Variant Callers",
+    y = "Variant Count"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    plot.title = element_text(size = 12, face = "bold"),
+    axis.title.x = element_text(size = 10),
+    axis.title.y = element_text(size = 10),
+    panel.grid.major.x = element_blank(),  # Remove x-axis grid lines
+    panel.grid.minor = element_blank()
+  )
+
+p
+```
+
+## Annotate the mutations with gene name using the transcript id
+
+```{r}
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+transcript_ids <- unique(STAD_mutation_filtered_pass$Transcript_ID)
+
+transcript_data <- getBM(attributes = c("ensembl_transcript_id", "hgnc_symbol", "transcript_length"),
+                         filters = "ensembl_transcript_id",
+                         values = transcript_ids,
+                         mart = ensembl)
+
+gene_lengths <- transcript_data %>%
+  group_by(hgnc_symbol) %>%
+  summarise(gene_length = max(transcript_length, na.rm = TRUE)) %>%
+  ungroup()
+```
+
+# 1. Start Aggregate mutations and annotate with gene lengths
+
+```{r}
+mutation_counts <- STAD_mutation_filtered_pass %>% 
+  group_by(Hugo_Symbol) %>% 
+  summarise(observed_mutations = n()) %>% 
+  ungroup()
+
+mutation_counts_with_GeneLength <- mutation_counts %>%
+  left_join(gene_lengths, by = c("Hugo_Symbol" = "hgnc_symbol"))
+
+mutation_counts_filtered <- mutation_counts_with_GeneLength %>%
+  filter(!is.na(gene_length))
+
+mutation_counts_filtered$log_gene_length <- log(mutation_counts_filtered$gene_length + 1e-6)
+```
+
+# 2. Calculate expected mutation using global mutate rate per bp
+
+```{r}
+total_mutations <- sum(mutation_counts_filtered$observed_mutations)
+total_length <- sum(mutation_counts_filtered$gene_length)
+avg_mutation_rate <- total_mutations / total_length
+cat("Average mutation rate (mutations per bp):", avg_mutation_rate, "\n")
+
+mutation_counts_filtered <- mutation_counts_filtered %>%
+  mutate(expected_mutations = gene_length * avg_mutation_rate)
+```
+
+# Observed mutation distribution and expected mutation
+
+```{r}
+ggplot(mutation_counts_filtered, aes(x = observed_mutations)) +
+  geom_histogram(binwidth = 1, fill = "lightblue", color = "black") +
+  labs(x = "Mutation Counts", y = "Gene Count", 
+       title = "Histogram of Observed Mutation Counts Across Genes") +
+  theme_minimal()
+
+ggplot(mutation_counts_filtered, aes(x = expected_mutations)) +
+  geom_histogram(binwidth = 1, fill = "lightblue", color = "black") +
+  labs(x = "Mutation Counts", y = "Gene Count", 
+       title = "Histogram of Expected Mutation Counts Across Genes") +
+  theme_minimal()
+```
+
+```{r}
+# Scatter Plot
+ggplot(mutation_counts_filtered, aes(x = gene_length, y = observed_mutations)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", color = "red") +
+  labs(x = "Gene Length (bp)", y = "Mutation Counts", 
+       title = "Observed Mutation Counts vs. Gene Length") +
+  theme_minimal()
+
+# Correlation Test
+cor_test <- cor.test(mutation_counts_filtered$gene_length, mutation_counts_filtered$observed_mutations, method = "pearson")
+print(cor_test)
+```
+
+# 3. Annotate average SIFT score and dNdS per gene
+
+```{r}
+STAD_mutation_filtered_pass <- STAD_mutation_filtered_pass %>%
+mutate(
+  SIFT_numeric = as.numeric(str_extract(SIFT, "(?<=\\()\\d*\\.?\\d*(?=\\))")),
+  SIFT = ifelse(SIFT == ".", NA, SIFT)
+)
+```
+
+```{r}
+impact_scores <- STAD_mutation_filtered_pass %>%
+  group_by(Hugo_Symbol) %>%
+  summarise(avg_sift = mean(SIFT_numeric, na.rm = TRUE)) %>%
+  ungroup()
+
+mutation_counts_filtered <- mutation_counts_filtered %>%
+  left_join(impact_scores, by = "Hugo_Symbol")
+
+mutation_counts_filtered$avg_sift <- replace(mutation_counts_filtered$avg_sift, is.na(mutation_counts_filtered$avg_sift), 0)
+```
+
+# Avg non-zero SIFT
+
+```{r}
+# Scatter Plot
+ggplot(mutation_counts_filtered, aes(x = avg_sift, y = observed_mutations)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", color = "red") +
+  labs(x = "Average SIFT", y = "Mutation Counts", 
+       title = "SIFT>0 vs. Mutation Counts") +
+  theme_minimal()
+
+# Correlation Test
+cor_test <- cor.test(mutation_counts_filtered$avg_sift, mutation_counts_filtered$observed_mutations, method = "pearson")
+print(cor_test)
+```
+
+# Avg SIFT
+
+```{r}
+# impact_scores <- STAD_mutation_filtered_pass %>%
+#   group_by(Hugo_Symbol) %>%
+#   summarise(avg_sift = mean(SIFT_numeric, na.rm = TRUE)) %>%
+#   ungroup()
+
+# mutation_counts_filtered <- mutation_counts_filtered %>%
+#   left_join(impact_scores, by = "Hugo_Symbol")
+
+# mutation_counts_filtered$avg_sift <- replace(mutation_counts_filtered$avg_sift, is.na(mutation_counts_filtered$avg_sift), 0)
+```
+
+```{r}
+# Scatter Plot
+ggplot(mutation_counts_filtered, aes(x = avg_sift, y = observed_mutations)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", color = "red") +
+  labs(x = "Average SIFT", y = "Mutation Counts", 
+       title = "SIFT vs. Mutation Counts") +
+  theme_minimal()
+
+# Correlation Test
+cor_test <- cor.test(mutation_counts_filtered$avg_sift, mutation_counts_filtered$observed_mutations, method = "pearson")
+print(cor_test)
+```
+
+```{r}
+mutation_types <- STAD_mutation_filtered_pass %>%
+  group_by(Hugo_Symbol) %>%
+  summarise(
+    dN = sum(Variant_Classification %in% c("Missense_Mutation", "Nonsense_Mutation", "Frame_Shift_Del", "Frame_Shift_Ins", "Splice_Site", "Translation_Start_Site")),
+    dS = sum(Variant_Classification %in% c("Silent", "5'UTR", "Intron", "3'UTR", "3'Flank", "5'Flank"))
+  ) %>%
+  ungroup() %>%
+  mutate(dN_dS = (dN / (dS + 1e-6)))
+
+mutation_counts_filtered <- mutation_counts_filtered %>%
+  left_join(mutation_types[, c("Hugo_Symbol", "dN_dS")], by = "Hugo_Symbol")
+```
+
+```{r}
+mutation_types <- STAD_mutation_filtered_pass %>%
+  group_by(Hugo_Symbol) %>%
+  summarise(
+    dN = sum(Variant_Classification %in% c("Missense_Mutation", "Nonsense_Mutation", "Frame_Shift_Del", "Frame_Shift_Ins", "Splice_Site", "Translation_Start_Site")),
+    dS = sum(Variant_Classification %in% c("Silent", "5'UTR", "Intron", "3'UTR", "3'Flank", "5'Flank"))
+  ) %>%
+  ungroup()
+
+mutation_counts_filtered <- mutation_counts_filtered %>%
+  left_join(mutation_types, by = "Hugo_Symbol")
+```
+
+# 4. Expected global syn mutation rate (ignore for now, switch to substitution model weighted expected_syn
+
+```{r}
+# total_syn_mutations <- sum(mutation_counts_filtered$dS)
+# total_length <- sum(mutation_counts_filtered$gene_length)
+# avg_syn_rate <- total_syn_mutations / total_length
+
+# mutation_counts_filtered <- mutation_counts_filtered %>%
+#   mutate(
+#     expected_syn = gene_length * avg_syn_rate
+#   )
+# cat("Average syn mutation rate (mutations per bp):", avg_syn_rate, "\n")
+```
+
+# 5. calculate t
+
+```{r}
+t <- (sum(mutation_counts_filtered$dS) + sum(mutation_counts_filtered$dN)) / total_length
+t
+```
+
+# 6. calculate expected_syn
+
+```{r}
+syn_by_substitution <- STAD_mutation_filtered_pass %>%
+  filter(Variant_Classification %in% c("Silent", "5'UTR", "Intron", "3'UTR", "3'Flank", "5'Flank")) %>%
+  mutate(substitution = paste(Reference_Allele, Tumor_Seq_Allele2, sep = ">")) %>%
+  group_by(Hugo_Symbol, substitution) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  pivot_wider(names_from = substitution, values_from = count, values_fill = 0, 
+              names_prefix = "syn_")
+
+dS_per_gene <- STAD_mutation_filtered_pass %>%
+  filter(Variant_Classification %in% c("Silent", "5'UTR", "Intron", "3'UTR", "3'Flank", "5'Flank")) %>%
+  group_by(Hugo_Symbol) %>%
+  summarise(dS = n(), .groups = "drop")
+
+mutation_counts_filtered <- mutation_counts_filtered %>%
+  {if ("dS" %in% colnames(.)) dplyr::select(., -dS) else .} %>%
+  left_join(dS_per_gene, by = "Hugo_Symbol") %>%
+  left_join(syn_by_substitution, by = "Hugo_Symbol") %>%
+  mutate(
+    dS = coalesce(dS, 0),
+    across(starts_with("syn_"), ~ coalesce(.x, 0))
+  )
+```
+
+```{r}
+substitution_counts <- STAD_mutation_filtered_pass %>%
+  mutate(substitution = paste(Reference_Allele, Tumor_Seq_Allele2, sep = ">")) %>%
+  group_by(substitution) %>%
+  summarise(count = n(), .groups = "drop")
+
+total_counts <- sum(substitution_counts$count)
+
+substitution_rates <- substitution_counts %>%
+  mutate(rate = count / total_counts)
+```
+
+```{r}
+head(substitution_rates)
+```
+
+```{r}
+syn_long <- mutation_counts_filtered %>%
+  dplyr::select(Hugo_Symbol, dplyr::starts_with("syn_")) %>%
+  pivot_longer(cols = dplyr::starts_with("syn_"), names_to = "substitution", 
+               values_to = "L_i_s", names_prefix = "syn_") %>%
+  filter(L_i_s > 0)
+
+syn_long_with_rates <- syn_long %>%
+  left_join(substitution_rates %>% dplyr::select(substitution, r_i = rate), 
+            by = "substitution")
+
+syn_long_with_rates <- syn_long_with_rates %>%
+  mutate(contribution = r_i * L_i_s)
+```
+
+```{r}
+expected_syn_per_gene <- syn_long_with_rates %>%
+  group_by(Hugo_Symbol) %>%
+  summarise(sum_contribution = sum(contribution), .groups = "drop") %>%
+  mutate(expected_syn = t * sum_contribution)
+
+mutation_counts_filtered <- mutation_counts_filtered %>%
+  left_join(expected_syn_per_gene %>% dplyr::select(Hugo_Symbol, expected_syn), 
+            by = "Hugo_Symbol")
+```
+
+```{r}
+mutation_counts_filtered <- mutation_counts_filtered %>%
+  mutate(expected_syn = coalesce(expected_syn, 0))
+```
+
+## Apply poisson distribution to calculate expected mutations and run poisson test
+
+```{r}
+# total_mutations <- nrow(STAD_mutation_filtered_pass)
+# total_gene_length <- sum(mutation_counts_filtered$gene_length, na.rm = TRUE)
+# mutation_counts_filtered$pos_expected_mutations <- (mutation_counts_filtered$gene_length / total_gene_length) * total_mutations
+
+mutation_counts_filtered$p_value <- mapply(function(obs, exp) {
+  poisson.test(obs, r = exp, alternative = "two.sided")$p.value
+}, mutation_counts_filtered$observed_mutations, mutation_counts_filtered$expected_mutations)
+
+mutation_counts_filtered$pos_adj_p_value <- p.adjust(mutation_counts_filtered$p_value, method = "BH")
+mutation_counts_filtered$pos_selection <- ifelse(mutation_counts_filtered$pos_adj_p_value < 0.05 & mutation_counts_filtered$observed_mutations > mutation_counts_filtered$expected_mutations, "Positive",
+                                    ifelse(mutation_counts_filtered$pos_adj_p_value < 0.05 & mutation_counts_filtered$observed_mutations < mutation_counts_filtered$expected_mutations, "Negative", "Neutral"))
+
+ggplot(mutation_counts_filtered, aes(x = expected_mutations, y = observed_mutations, color = pos_selection)) +
+  geom_point(alpha = 0.6) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "black") +
+  scale_color_manual(values = c("Positive" = "red", "Negative" = "blue", "Neutral" = "gray")) +
+  labs(x = "Expected Mutations", y = "Observed Mutations",
+       title = "Observed vs. Expected Mutations by Poisson") +
+  theme_minimal()
+```
+
+```{r}
+pos_positive_genes <- mutation_counts_filtered %>%
+  filter(pos_selection == "Negative" & pos_adj_p_value < 0.05)
+
+significant_genes <- pos_positive_genes$Hugo_Symbol
+consequence_summary <- STAD_mutation_filtered_pass %>%
+  filter(Hugo_Symbol %in% significant_genes) %>%
+  group_by(Hugo_Symbol, Variant_Classification) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(Variant_Classification) %>%
+  summarise(total_count = sum(count), .groups = "drop")
+
+consequence_summary <- consequence_summary %>%
+  mutate(proportion = total_count / sum(total_count))
+
+ggplot(consequence_summary, aes(x = Variant_Classification, y = proportion, fill = Variant_Classification)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Consequence in Significant Poisson Negative Genes",
+       x = "Consequence", y = "Proportion") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+pos_positive_genes <- mutation_counts_filtered %>%
+  filter(pos_selection == "Positive", pos_adj_p_value < 0.05)
+
+pos_negative_genes <- mutation_counts_filtered %>%
+  filter(pos_selection == "Negative", pos_adj_p_value < 0.05)
+
+get_conversion_summary <- function(gene_set, label) {
+  STAD_mutation_filtered_pass %>%
+    filter(Hugo_Symbol %in% gene_set$Hugo_Symbol) %>%
+    mutate(conversion = paste0(Reference_Allele, ">", Tumor_Seq_Allele2)) %>%
+    group_by(conversion) %>%
+    summarise(count = n(), .groups = "drop") %>%
+    mutate(direction = label)
+}
+
+conversion_positive <- get_conversion_summary(pos_positive_genes, "Positive Selection")
+conversion_negative <- get_conversion_summary(pos_negative_genes, "Negative Selection")
+
+conversion_combined <- bind_rows(conversion_positive, conversion_negative) %>%
+  group_by(direction) %>%
+  mutate(proportion = count / sum(count)) %>%
+  ungroup()
+
+ggplot(conversion_combined, aes(x = direction, y = proportion, fill = conversion)) +
+  geom_bar(stat = "identity") +
+  labs(
+    title = "Mutation Conversion Proportions by Poisson",
+    x = "Conversion Type", y = "Proportion", fill = "Conversion"
+  ) +
+  theme_minimal()
+```
+
+# Some hypotheses
+
+```{r}
+null_model <- glm(observed_mutations ~ 1 + offset(log_gene_length ), 
+                  family = poisson(), 
+                  data = mutation_counts_filtered)
+
+alt1_model <- glm(observed_mutations ~ avg_sift + offset(log_gene_length), 
+                  family = poisson(), 
+                  data = mutation_counts_filtered)
+
+alt2_model <- glm(observed_mutations ~ dN_dS + offset(log_gene_length), 
+                  family = poisson(), 
+                  data = mutation_counts_filtered)
+
+combined_model <- glm(observed_mutations ~ avg_sift + dN_dS + offset(log_gene_length), 
+                      family = poisson(), 
+                      data = mutation_counts_filtered)
+
+models <- list("SIFT" = alt1_model, 
+               "Mutation Type" = alt2_model, 
+               "Combined" = combined_model)
+
+for (name in names(models)) {
+  alt_model <- models[[name]]
+  print(AIC(null_model, models[[name]]))
+  lrt <- lrtest(null_model, alt_model)
+  cat(sprintf("\nLikelihood Ratio Test: %s vs. Null\n", name))
+  cat(sprintf("LR Statistic: %.30f, P-value: %.30f\n", lrt[2, "Chisq"], lrt[2, "Pr(>Chisq)"]))
+}
+
+dispersion_stat <- summary(combined_model)$deviance / summary(combined_model)$df.residual
+cat("\nDispersion statistic for Combined Poisson Model:", dispersion_stat, "\n")
+if (dispersion_stat > 1.5) {
+  cat("Overdispersion.\n")
+}
+```
+
+```{r}
+AIC(alt2_model)
+```
+
+```{r}
+AIC(combined_model)
+```
+
+```{r}
+fitted_values <- fitted(alt2_model)
+std_deviance_residuals <- residuals(combined_model, type = "deviance") / sqrt(summary(combined_model)$dispersion)
+
+plot_data <- data.frame(
+  Predicted_Mean = fitted_values,
+  Std_Dev_Residual = std_deviance_residuals
+)
+
+ggplot(plot_data, aes(x = Predicted_Mean, y = Std_Dev_Residual)) +
+  geom_point(alpha = 0.5) +
+  geom_hline(yintercept = 0, color = "black", linetype = "solid") +
+  geom_hline(yintercept = c(-2, 2), color = "red", linetype = "dashed") +
+  labs(x = "Predicted Mean (Fitted Values)",
+       y = "Standardized Deviance Residual",
+       title = "Deviance Residual Plot for dNdS Poisson Model") +
+  theme_minimal()
+```
+
+# Try different on NB
+
+### Offset log gene length 
+
+```{r}
+# Null Model
+null_model <- glm.nb(observed_mutations ~ 1 + offset(log_gene_length), 
+                     data = mutation_counts_filtered)
+
+# Alternative Models
+alt1_model <- glm.nb(observed_mutations ~ avg_sift + offset(log_gene_length), 
+                     data = mutation_counts_filtered)
+
+alt2_model <- glm.nb(observed_mutations ~ dN_dS + offset(log_gene_length), 
+                     data = mutation_counts_filtered)
+
+
+combined_model <- glm.nb(observed_mutations ~ avg_sift + dN_dS + offset(log_gene_length), 
+                         data = mutation_counts_filtered)
+
+# Likelihood Ratio Tests
+models <- list("SIFT" = alt1_model, 
+               "Mutation Type" = alt2_model,  
+               "Combined" = combined_model)
+
+for (name in names(models)) {
+  alt_model <- models[[name]]
+  print(AIC(null_model, models[[name]]))
+  lrt <- lrtest(null_model, alt_model)
+  cat(sprintf("\nLikelihood Ratio Test: %s vs. Null\n", name))
+  cat(sprintf("LR Statistic: %.10f, P-value: %.40f\n", lrt[2, "Chisq"], lrt[2, "Pr(>Chisq)"]))
+}
+
+
+dispersion_stat <- summary(combined_model)$deviance / summary(combined_model)$df.residual
+cat("\nDispersion statistic for Combined Negative Model:", dispersion_stat, "\n")
+if (dispersion_stat > 1.5) {
+  cat("Overdispersion.\n")
+}
+```
+
+```{r}
+fitted_values <- fitted(alt2_model)
+std_deviance_residuals <- residuals(combined_model, type = "deviance") / sqrt(summary(combined_model)$dispersion)
+
+plot_data <- data.frame(
+  Predicted_Mean = fitted_values,
+  Std_Dev_Residual = std_deviance_residuals
+)
+
+ggplot(plot_data, aes(x = Predicted_Mean, y = Std_Dev_Residual)) +
+  geom_point(alpha = 0.5) +
+  geom_hline(yintercept = 0, color = "black", linetype = "solid") +
+  geom_hline(yintercept = c(-2, 2), color = "red", linetype = "dashed") +
+  labs(x = "Predicted Mean (Fitted Values)",
+       y = "Standardized Deviance Residual",
+       title = "Deviance Residual Plot for dNdS Negative Binomial Model") +
+  theme_minimal()
+```
+
+```{r}
+fitted_values <- fitted(combined_model)
+std_deviance_residuals <- residuals(combined_model, type = "deviance") / sqrt(summary(combined_model)$dispersion)
+
+plot_data <- data.frame(
+  Predicted_Mean = fitted_values,
+  Std_Dev_Residual = std_deviance_residuals
+)
+
+ggplot(plot_data, aes(x = Predicted_Mean, y = Std_Dev_Residual)) +
+  geom_point(alpha = 0.5) +
+  geom_hline(yintercept = 0, color = "black", linetype = "solid") +
+  geom_hline(yintercept = c(-2, 2), color = "red", linetype = "dashed") +
+  labs(x = "Predicted Mean (Fitted Values)",
+       y = "Standardized Deviance Residual",
+       title = "Deviance Residual Plot for Combined Negative Binomial Model") +
+  theme_minimal()
+```
+
+### Offset log expected mutations
+
+```{r}
+mutation_counts_filtered$log_expected_mutations = log(mutation_counts_filtered$expected_mutations)
+```
+
+```{r}
+# Null Model
+null_model <- glm.nb(observed_mutations ~ 1 + offset(log_expected_mutations), 
+                     data = mutation_counts_filtered)
+
+# Alternative Models
+alt1_model <- glm.nb(observed_mutations ~ avg_sift + offset(log_expected_mutations), 
+                     data = mutation_counts_filtered)
+
+alt2_model <- glm.nb(observed_mutations ~ dN_dS + offset(log_expected_mutations), 
+                     data = mutation_counts_filtered)
+
+
+combined_model <- glm.nb(observed_mutations ~ avg_sift + dN_dS + offset(log_expected_mutations), 
+                         data = mutation_counts_filtered)
+
+# Likelihood Ratio Tests
+models <- list("SIFT" = alt1_model, 
+               "Mutation Type" = alt2_model,  
+               "Combined" = combined_model)
+
+for (name in names(models)) {
+  print(AIC(null_model, models[[name]]))
+  alt_model <- models[[name]]
+  lrt <- lrtest(null_model, alt_model)
+  cat(sprintf("\nLikelihood Ratio Test: %s vs. Null\n", name))
+  cat(sprintf("LR Statistic: %.10f, P-value: %.40f\n", lrt[2, "Chisq"], lrt[2, "Pr(>Chisq)"]))
+}
+
+
+dispersion_stat <- summary(combined_model)$deviance / summary(combined_model)$df.residual
+cat("\nDispersion statistic for Combined Negative Model:", dispersion_stat, "\n")
+if (dispersion_stat > 1.5) {
+  cat("Overdispersion.\n")
+}
+```
+
+# Use the log gene length combined model
+
+```{r}
+mutation_counts_filtered$expected_mutations_combined <- predict(combined_model, type = "response")
+
+mutation_counts_filtered <- mutation_counts_filtered %>%
+  mutate(
+    diff_obs_exp = observed_mutations - expected_mutations_combined,
+    ratio_obs_exp = observed_mutations / expected_mutations_combined
+  )
+
+# Use a Negative Binomial test: compare observed to expected under the NB distribution
+mutation_counts_filtered$p_value <- sapply(1:nrow(mutation_counts_filtered), function(i) {
+  obs <- mutation_counts_filtered$observed_mutations[i]
+  exp <- mutation_counts_filtered$expected_mutations_combined[i]
+  theta <- combined_model$theta
+  if (obs > exp) {
+    p <- 1 - pnbinom(obs - 1, mu = exp, size = theta)
+  } else {
+    p <- pnbinom(obs, mu = exp, size = theta)
+  }
+  return(p)
+})
+
+
+
+mutation_counts_filtered$adj_p_value <- p.adjust(mutation_counts_filtered$p_value, method = "BH")
+mutation_counts_filtered <- mutation_counts_filtered %>%
+  mutate(
+    selection_status = case_when(
+      adj_p_value < 0.05 & ratio_obs_exp > 1 ~ "Positive",
+      adj_p_value < 0.05 & ratio_obs_exp < 1 ~ "Negative",
+      TRUE ~ "Neutral"
+    )
+  )
+
+positive_selection <- mutation_counts_filtered %>%
+  filter(selection_status == "Positive") %>%
+  arrange(adj_p_value) %>%
+  dplyr::select(Hugo_Symbol, observed_mutations, expected_mutations_combined, diff_obs_exp, ratio_obs_exp, adj_p_value)
+
+negative_selection <- mutation_counts_filtered %>%
+  filter(selection_status == "Negative") %>%
+  arrange(adj_p_value) %>%
+  dplyr::select(Hugo_Symbol, observed_mutations, expected_mutations_combined, diff_obs_exp, ratio_obs_exp, adj_p_value)
+
+cat("\nGenes under Positive Selection:\n")
+print(positive_selection)
+cat("\nGenes under Negative Selection:\n")
+print(negative_selection)
+
+ggplot(mutation_counts_filtered, aes(x = expected_mutations_combined, y = observed_mutations, color = selection_status)) +
+  geom_point(alpha = 0.6) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "black") +
+  scale_color_manual(values = c("Positive" = "red", "Negative" = "blue", "Neutral" = "gray")) +
+  labs(x = "Expected Mutations (Combined Model)", y = "Observed Mutations",
+       title = "Observed vs. Expected Mutations by Negative Binomial") +
+  theme_minimal()
+```
+
+```{r}
+print(AIC(combined_model))
+```
+
+```{r}
+pos_positive_genes <- mutation_counts_filtered %>%
+  filter(selection_status == "Positive" & adj_p_value < 0.05)
+
+significant_genes <- pos_positive_genes$Hugo_Symbol
+consequence_summary <- STAD_mutation_filtered_pass %>%
+  filter(Hugo_Symbol %in% significant_genes) %>%
+  group_by(Hugo_Symbol, Variant_Classification) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(Variant_Classification) %>%
+  summarise(total_count = sum(count), .groups = "drop")
+
+consequence_summary <- consequence_summary %>%
+  mutate(proportion = total_count / sum(total_count))
+
+ggplot(consequence_summary, aes(x = Variant_Classification, y = proportion, fill = Variant_Classification)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Consequence in Significant Negative Binomial Positive Genes",
+       x = "Consequence", y = "Proportion") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+pos_positive_genes <- mutation_counts_filtered %>%
+  filter(selection_status == "Positive", adj_p_value < 0.05)
+
+pos_negative_genes <- mutation_counts_filtered %>%
+  filter(selection_status == "Negative", adj_p_value < 0.05)
+
+get_conversion_summary <- function(gene_set, label) {
+  STAD_mutation_filtered_pass %>%
+    filter(Hugo_Symbol %in% gene_set$Hugo_Symbol) %>%
+    mutate(conversion = paste0(Reference_Allele, ">", Tumor_Seq_Allele2)) %>%
+    group_by(conversion) %>%
+    summarise(count = n(), .groups = "drop") %>%
+    mutate(direction = label)
+}
+
+conversion_positive <- get_conversion_summary(pos_positive_genes, "Positive Selection")
+conversion_negative <- get_conversion_summary(pos_negative_genes, "Negative Selection")
+
+conversion_combined <- bind_rows(conversion_positive, conversion_negative) %>%
+  group_by(direction) %>%
+  mutate(proportion = count / sum(count)) %>%
+  ungroup()
+
+ggplot(conversion_combined, aes(x = direction, y = proportion, fill = conversion)) +
+  geom_bar(stat = "identity") +
+  labs(
+    title = "Mutation Conversion Proportions by NB",
+    x = "Conversion Type", y = "Proportion", fill = "Conversion"
+  ) +
+  theme_minimal()
+```
+
+## dndscv log expected syn mutations
+
+```{r}
+dNdScv_model <- glm.nb(dS ~ dN_dS + offset(log(expected_syn + 1e-6)), 
+                   data = mutation_counts_filtered)
+
+mutation_counts_filtered$expected_syn_predicted <- fitted(dNdScv_model)
+
+models <- list("dNdS Model" = dNdScv_model)
+
+for (name in names(models)) {
+  alt_model <- models[[name]]
+  print(AIC(null_model, models[[name]]))
+  lrt <- lrtest(null_model, alt_model)
+  cat(sprintf("\nLikelihood Ratio Test: %s vs. Null\n", name))
+  cat(sprintf("LR Statistic: %.30f, P-value: %.30f\n", lrt[2, "Chisq"], lrt[2, "Pr(>Chisq)"]))
+}
+```
+
+```{r}
+fitted_values <- fitted(dNdScv_model)
+std_deviance_residuals <- residuals(dNdScv_model, type = "deviance") / sqrt(summary(dNdScv_model)$dispersion)
+
+plot_data <- data.frame(
+  Predicted_Mean = fitted_values,
+  Std_Dev_Residual = std_deviance_residuals
+)
+
+ggplot(plot_data, aes(x = Predicted_Mean, y = Std_Dev_Residual)) +
+  geom_point(alpha = 0.5) +
+  geom_hline(yintercept = 0, color = "black", linetype = "solid") +
+  geom_hline(yintercept = c(-2, 2), color = "red", linetype = "dashed") +
+  labs(x = "Predicted Mean (Fitted Values)",
+       y = "Standardized Deviance Residual",
+       title = "Deviance Residual Plot for dNdScv Model") +
+  theme_minimal()
+```
+
+```{r}
+mutation_counts_filtered <- mutation_counts_filtered %>%
+  mutate(
+    expected_dN_predicted = expected_syn_predicted * dN_dS
+)
+```
+
+```{r}
+mutation_counts_filtered$p_value_dN <- sapply(1:nrow(mutation_counts_filtered), function(i) {
+  obs <- mutation_counts_filtered$dN[i]
+  exp <- mutation_counts_filtered$expected_dN_predicted[i]
+  theta <- dNdScv_model$theta
+  if (obs > exp) {
+    p <- 1 - pnbinom(obs - 1, mu = exp, size = theta)
+  } else {
+    p <- pnbinom(obs, mu = exp, size = theta)
+  }
+  return(p)
+})
+
+
+mutation_counts_filtered$adj_p_value_dN <- p.adjust(mutation_counts_filtered$p_value_dN, method = "BH")
+```
+
+```{r}
+# mutation_counts_filtered$adj_p_value_dN <- p.adjust(mutation_counts_filtered$p_value_dN, method = "bonferroni")
+```
+
+```{r}
+mutation_counts_filtered$predicted_dNdS = mutation_counts_filtered$expected_dN_predicted / mutation_counts_filtered$expected_syn_predicted
+```
+
+```{r}
+mutation_counts_filtered <- mutation_counts_filtered %>%
+  mutate(
+    dndscv_selection = case_when(
+      adj_p_value_dN < 0.05 & predicted_dNdS < dN_dS ~ "Positive",
+      adj_p_value_dN < 0.05 & predicted_dNdS > dN_dS ~ "Negative",
+      TRUE ~ "Neutral"
+    )
+  )
+```
+
+```{r}
+table(mutation_counts_filtered$dndscv_selection)
+```
+
+```{r}
+pos_positive_genes <- mutation_counts_filtered %>%
+  filter(dndscv_selection == "Positive" & adj_p_value_dN < 0.05)
+
+significant_genes <- pos_positive_genes$Hugo_Symbol
+consequence_summary <- STAD_mutation_filtered_pass %>%
+  filter(Hugo_Symbol %in% significant_genes) %>%
+  group_by(Hugo_Symbol, Variant_Classification) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(Variant_Classification) %>%
+  summarise(total_count = sum(count), .groups = "drop")
+
+consequence_summary <- consequence_summary %>%
+  mutate(proportion = total_count / sum(total_count))
+
+ggplot(consequence_summary, aes(x = Variant_Classification, y = proportion, fill = Variant_Classification)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Consequence in Significant dNdS Model Positive Genes",
+       x = "Consequence", y = "Proportion") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+ggplot(mutation_counts_filtered, aes(x = expected_syn, y = dN, color = dndscv_selection)) +
+  geom_point(alpha = 0.6) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "black") +
+  scale_color_manual(values = c("Positive" = "red", "Negative" = "blue", "Neutral" = "gray")) +
+  labs(x = "Expected Syn Mutations", y = "Observed Syn Mutations",
+       title = "Observed Syn vs. Expected Syn Mutations") +
+  theme_minimal()
+```
+
+```{r}
+pos_positive_genes <- mutation_counts_filtered %>%
+  filter(dndscv_selection == "Negative" & adj_p_value_dN < 0.05)
+
+significant_genes <- pos_positive_genes$Hugo_Symbol
+consequence_summary <- STAD_mutation_filtered_pass %>%
+  filter(Hugo_Symbol %in% significant_genes) %>%
+  group_by(Hugo_Symbol, Variant_Classification) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(Variant_Classification) %>%
+  summarise(total_count = sum(count), .groups = "drop")
+
+consequence_summary <- consequence_summary %>%
+  mutate(proportion = total_count / sum(total_count))
+
+ggplot(consequence_summary, aes(x = Variant_Classification, y = proportion, fill = Variant_Classification)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Consequence in Significant dNdS Model Negative Genes",
+       x = "Consequence", y = "Proportion") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+class_counts_df <- as.data.frame(table(mutation_counts_filtered$dndscv_selection))
+colnames(class_counts_df) <- c("Selection_Class", "Count")
+
+ggplot(class_counts_df, aes(x = Selection_Class, y = Count, fill = Selection_Class)) +
+  geom_bar(stat = "identity", color = "black") +
+  scale_fill_manual(values = c("Positive" = "red", "Negative" = "blue", "Neutral" = "grey")) +
+  labs(x = "Selection Class", y = "Count", 
+       title = "Frequency of Selection Classes (dNdScv approach)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+```{r}
+pos_positive_genes <- mutation_counts_filtered %>%
+  filter(dndscv_selection == "Positive", adj_p_value_dN < 0.05)
+
+pos_negative_genes <- mutation_counts_filtered %>%
+  filter(dndscv_selection == "Negative", adj_p_value_dN < 0.05)
+
+get_conversion_summary <- function(gene_set, label) {
+  STAD_mutation_filtered_pass %>%
+    filter(Hugo_Symbol %in% gene_set$Hugo_Symbol) %>%
+    mutate(conversion = paste0(Reference_Allele, ">", Tumor_Seq_Allele2)) %>%
+    group_by(conversion) %>%
+    summarise(count = n(), .groups = "drop") %>%
+    mutate(direction = label)
+}
+
+conversion_positive <- get_conversion_summary(pos_positive_genes, "Positive Selection")
+conversion_negative <- get_conversion_summary(pos_negative_genes, "Negative Selection")
+
+conversion_combined <- bind_rows(conversion_positive, conversion_negative) %>%
+  group_by(direction) %>%
+  mutate(proportion = count / sum(count)) %>%
+  ungroup()
+
+ggplot(conversion_combined, aes(x = direction, y = proportion, fill = conversion)) +
+  geom_bar(stat = "identity") +
+  labs(
+    title = "Mutation Conversion Proportions by dNdS Model",
+    x = "Conversion Type", y = "Proportion", fill = "Conversion"
+  ) +
+  theme_minimal()
+```
+
+### End of dndscv approach
+
+```{r}
+selected_data <- subset(mutation_counts_filtered, 
+                        select = c("expected_mutations", "expected_mutations_combined"))
+```
+
+```{r}
+cor(x = selected_data$expected_mutations, y = selected_data$expected_mutations_combined, use = "everything",
+    method = c("pearson"))
+
+cor(x = selected_data$expected_mutations, y = selected_data$expected_mutations_combined, use = "everything",
+    method = c("spearman"))
+```
+
+## Apply binomial on dN/dS or dN/(dN + dS)
+
+```{r}
+expected_dN_dS <- mean(mutation_counts_filtered$dN) / mean(mutation_counts_filtered$dS)
+mutation_counts_filtered$total_mutations <- mutation_counts_filtered$dN + mutation_counts_filtered$dS
+# mutation_counts_filtered$expected_dN <- mutation_counts_filtered$dS * expected_dN_dS
+# mutation_counts_filtered$adj_total_mutations <- mutation_counts_filtered$expected_dN + mutation_counts_filtered$dS
+
+mutation_counts_filtered$dN_frac <- mutation_counts_filtered$dN / (mutation_counts_filtered$dN + mutation_counts_filtered$dS)
+expected_dN_frac <- mean(mutation_counts_filtered$dN) / (mean(mutation_counts_filtered$dN) + mean(mutation_counts_filtered$dS))
+mutation_counts_filtered$expected_dN <- as.integer(mutation_counts_filtered$total_mutations * expected_dN_frac)
+
+mutation_counts_filtered$dnds_p_value <- mapply(function(dN, total, exp_dN) {
+  if (total == 0) return(1)
+  binom.test(dN, total, p = exp_dN/total, alternative = "two.sided")$p.value
+}, mutation_counts_filtered$dN, mutation_counts_filtered$total_mutations, mutation_counts_filtered$expected_dN)
+
+mutation_counts_filtered$dnds_adj_p_value <- p.adjust(mutation_counts_filtered$dnds_p_value, method = "BH")
+mutation_counts_filtered$dnds_selection <- ifelse(mutation_counts_filtered$dnds_adj_p_value < 0.05 & 
+                                                  mutation_counts_filtered$dN > mutation_counts_filtered$expected_dN, "Positive",
+                                                  ifelse(mutation_counts_filtered$dnds_adj_p_value < 0.05 & 
+                                                         mutation_counts_filtered$dN < mutation_counts_filtered$expected_dN, "Negative", "Neutral"))
+```
+
+```{r}
+ggplot(mutation_counts_filtered, aes(x = expected_dN, y = dN, color = dnds_selection)) +
+  geom_point(alpha = 0.6) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "black") +
+  scale_color_manual(values = c("Positive" = "red", "Negative" = "blue", "Neutral" = "gray")) +
+  labs(x = "Expected dN Frac", y = "Observed dN Frac",
+       title = "Observed dN Frac vs. Expected dN Frac Mutations") +
+  theme_minimal()
+```
+
+```{r}
+pos_positive_genes <- mutation_counts_filtered %>%
+  filter(dnds_selection == "Positive" & dnds_adj_p_value < 0.05)
+
+significant_genes <- pos_positive_genes$Hugo_Symbol
+consequence_summary <- STAD_mutation_filtered_pass %>%
+  filter(Hugo_Symbol %in% significant_genes) %>%
+  group_by(Hugo_Symbol, Variant_Classification) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(Variant_Classification) %>%
+  summarise(total_count = sum(count), .groups = "drop")
+
+consequence_summary <- consequence_summary %>%
+  mutate(proportion = total_count / sum(total_count))
+
+ggplot(consequence_summary, aes(x = Variant_Classification, y = proportion, fill = Variant_Classification)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Consequence in Significant Binomial Approach Positive Genes",
+       x = "Consequence", y = "Proportion") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+class_counts_df <- as.data.frame(table(mutation_counts_filtered$dnds_selection))
+colnames(class_counts_df) <- c("Selection_Class", "Count")
+
+ggplot(class_counts_df, aes(x = Selection_Class, y = Count, fill = Selection_Class)) +
+  geom_bar(stat = "identity", color = "black") +
+  scale_fill_manual(values = c("Positive" = "red", "Negative" = "blue", "Neutral" = "grey")) +
+  labs(x = "Selection Class", y = "Count", 
+       title = "Frequency of Selection Classes (Empirical Bayes)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+```{r}
+pos_positive_genes <- mutation_counts_filtered %>%
+  filter(dnds_selection == "Positive", dnds_adj_p_value < 0.05)
+
+pos_negative_genes <- mutation_counts_filtered %>%
+  filter(dnds_selection == "Negative", dnds_adj_p_value < 0.05)
+
+get_conversion_summary <- function(gene_set, label) {
+  STAD_mutation_filtered_pass %>%
+    filter(Hugo_Symbol %in% gene_set$Hugo_Symbol) %>%
+    mutate(conversion = paste0(Reference_Allele, ">", Tumor_Seq_Allele2)) %>%
+    group_by(conversion) %>%
+    summarise(count = n(), .groups = "drop") %>%
+    mutate(direction = label)
+}
+
+conversion_positive <- get_conversion_summary(pos_positive_genes, "Positive Selection")
+conversion_negative <- get_conversion_summary(pos_negative_genes, "Negative Selection")
+
+conversion_combined <- bind_rows(conversion_positive, conversion_negative) %>%
+  group_by(direction) %>%
+  mutate(proportion = count / sum(count)) %>%
+  ungroup()
+
+ggplot(conversion_combined, aes(x = direction, y = proportion, fill = conversion)) +
+  geom_bar(stat = "identity") +
+  labs(
+    title = "Mutation Conversion Proportions by dNdS Binomial",
+    x = "Conversion Type", y = "Proportion", fill = "Conversion"
+  ) +
+  theme_minimal()
+```
+
+# Benchmark against filtered STAD_mutation
+
+```{r}
+STAD_mutation_sub <- STAD_mutation_filtered_pass[, c("patient_id", "Chromosome", "Start_Position", "Reference_Allele", "Tumor_Seq_Allele2")]
+colnames(STAD_mutation_sub) <- c("sampleID", "chr", "pos", "ref", "mut")
+```
+
+```{r}
+STAD_dndsout <- dndscv(STAD_mutation_sub)
+```
+
+```{r}
+print(STAD_dndsout$nbreg$theta)
+```
+
+```{r}
+STAD_sel_cv = STAD_dndsout$sel_cv
+STAD_signif_genes = STAD_sel_cv[STAD_sel_cv$qallsubs_cv<0.05, c("gene_name","qallsubs_cv")]
+```
+
+```{r}
+nb_sig_genes <- mutation_counts_filtered %>%
+  filter(selection_status == "Positive" & adj_p_value < 0.05) %>%
+  pull(Hugo_Symbol) %>%
+  unique()
+
+dndscv_positive_genes <- mutation_counts_filtered %>%
+  filter(dndscv_selection == "Positive" & adj_p_value_dN < 0.05) %>%
+  pull(Hugo_Symbol) %>%
+  unique()
+
+bi_dnds_positive_genes <- mutation_counts_filtered %>%
+  filter(dnds_selection == "Positive" & dnds_adj_p_value < 0.05) %>%
+  pull(Hugo_Symbol) %>%
+  unique()
+
+dndscv_significant_genes <- STAD_sel_cv %>%
+  filter(qallsubs_cv < 0.05) %>%
+  pull(gene_name) %>%
+  unique()
+
+fill_colors <- c("red", "blue", 'brown', 'black')
+
+venn_plot <- venn.diagram(
+  x = list(
+    "NB Model" = nb_sig_genes,
+    "NB dNdS" = dndscv_positive_genes,
+    "STAD dNdScv" = dndscv_significant_genes,
+    "Binomial" = bi_dnds_positive_genes
+  ),
+  filename = NULL, 
+  fill = fill_colors,
+  main = "Comparison of Sig. Positive Genes",
+  alpha = 0.5,
+  label.col = "black",
+  cex = 2, 
+  cat.cex = 1,
+  cat.col = fill_colors,
+  margin = 0.1
+)
+grid.draw(venn_plot)
+```
+
+```{r}
+intersect(nb_sig_genes, dndscv_significant_genes)
+```
+
+```{r}
+intersect(bi_dnds_positive_genes, dndscv_significant_genes)
+```
+
+```{r}
+signif_genes_localmodel = as.vector(STAD_dndsout$sel_loc$gene_name[STAD_dndsout$sel_loc$qall_loc<0.05])
+print(signif_genes_localmodel)
+```
+
+```{r}
+nb_sig_genes <- mutation_counts_filtered %>%
+  filter(selection_status == "Positive" & adj_p_value < 0.05) %>%
+  pull(Hugo_Symbol) %>%
+  unique()
+
+dndscv_positive_genes <- mutation_counts_filtered %>%
+  filter(dndscv_selection == "Positive" & adj_p_value_dN < 0.05) %>%
+  pull(Hugo_Symbol) %>%
+  unique()
+
+dndscv_significant_genes <- STAD_sel_cv %>%
+  filter(qallsubs_cv < 0.05) %>%
+  pull(gene_name) %>%
+  unique()
+
+fill_colors <- c("red", "blue", 'brown')
+
+venn_plot <- venn.diagram(
+  x = list(
+    "nb Positive Selection" = nb_sig_genes,
+    "dndscv  Positive Selection" = dndscv_positive_genes,
+    "STAD_sel_cv (qallsubs_cv < 0.1)" = dndscv_significant_genes
+  ),
+  filename = NULL, 
+  fill = fill_colors,
+  alpha = 0.5,
+  label.col = "black",
+  cex = 2, 
+  cat.cex = 1.5,
+  cat.col = fill_colors,
+  margin = 0.1
+)
+grid.draw(venn_plot)
+```
+
+```{r}
+IntOGen = read_tsv("IntOGen-DriverGenes_STAD.tsv", quote="\"")
+```
+
+```{r}
+head(IntOGen)
+```
+
+```{r}
+nb_sig_genes <- mutation_counts_filtered %>%
+  filter(selection_status == "Positive" & adj_p_value < 0.05) %>%
+  pull(Hugo_Symbol) %>%
+  unique()
+
+bi_dnds_positive_genes <- mutation_counts_filtered %>%
+  filter(dnds_selection == "Positive" & dnds_adj_p_value < 0.05) %>%
+  pull(Hugo_Symbol) %>%
+  unique()
+
+dndscv_significant_genes <- STAD_sel_cv %>%
+  filter(qallsubs_cv < 0.05) %>%
+  pull(gene_name) %>%
+  unique()
+
+IntOGen_genes <- IntOGen %>%
+  pull(Symbol) %>%
+  unique()
+
+fill_colors <- c("red", "blue", 'brown', 'black')
+
+venn_plot <- venn.diagram(
+  x = list(
+    "NB model" = nb_sig_genes,
+    "Binomial" = bi_dnds_positive_genes,
+    "dNdScv" = dndscv_significant_genes,
+    "IntOGen STAD" = IntOGen_genes
+  ),
+  filename = NULL, 
+  fill = fill_colors,
+  alpha = 0.5,
+  label.col = "black",
+  cex = 2, 
+  cat.cex = 1.5,
+  cat.col = fill_colors,
+  margin = 0.1
+)
+grid.draw(venn_plot)
+```
+
+```{r}
+intersect(bi_dnds_positive_genes, IntOGen_genes)
+```
+
+# Take a look at full STAD_mutation
+
+```{r}
+full_STAD_mutation <- STAD_mutation[, c("patient_id", "Chromosome", "Start_Position", "Reference_Allele", "Tumor_Seq_Allele2")]
+colnames(full_STAD_mutation) <- c("sampleID", "chr", "pos", "ref", "mut")
+```
+
+```{r}
+full_STAD_dndsout <- dndscv(full_STAD_mutation)
+```
+
+```{r}
+print(full_STAD_dndsout$nbreg$theta)
+```
+
+```{r}
+full_signif_genes_localmodel = as.vector(full_STAD_dndsout$sel_loc$gene_name[full_STAD_dndsout$sel_loc$qall_loc<0.1])
+print(full_signif_genes_localmodel)
+```
+
+```{r}
+library(car)
+```
+
+```{r}
+vif(combined_model)
+```
+
+# 20250429_oncodriveFML_corrected
+
+```{r}
+FML = read_delim("20250429cbase/q_values_20250429cbase.txt", delim="\t", skip = 1)
+```
+
+```{r}
+nb_sig_genes <- mutation_counts_filtered %>%
+  filter(selection_status == "Positive" & adj_p_value < 0.05) %>%
+  pull(Hugo_Symbol) %>%
+  unique()
+
+bi_dnds_positive_genes <- mutation_counts_filtered %>%
+  filter(dnds_selection == "Positive" & dnds_adj_p_value < 0.05) %>%
+  pull(Hugo_Symbol) %>%
+  unique()
+
+dndscv_significant_genes <- STAD_sel_cv %>%
+  filter(qallsubs_cv < 0.05) %>%
+  pull(gene_name) %>%
+  unique()
+
+FML_sig_genes <- FML %>%
+  filter(q_phi_pos < 0.05) %>%
+  pull(gene) %>%
+  unique()
+
+fill_colors <- c("red", "blue", 'brown', 'purple')
+
+venn_plot <- venn.diagram(
+  x = list(
+    "nb Positive Selection" = nb_sig_genes,
+    "STAD_sel_cv (qallsubs_cv < 0.1)" = dndscv_significant_genes,
+    "binomial dn/ds Positive Selection" = bi_dnds_positive_genes,
+    "FML Positive Selection" = FML_sig_genes
+  ),
+  filename = NULL, 
+  fill = fill_colors,
+  # alpha = 0.5,
+  label.col = "black",
+  # cex = 2, 
+  # cat.cex = 1.5,
+  cat.col = fill_colors,
+  margin = 0.1
+)
+grid.draw(venn_plot)
+```
+
+#  20250429_oncodriveCLUSTL_STAD_corrected
+
+```{r}
+CLUSTL = read_delim("20250429_oncoCLUST/clusters_results.tsv", delim="\t", show_col_types = FALSE)
+```
+
+```{r}
+CLUSTL$adj_p_value <- p.adjust(CLUSTL$P, method = "BH")
+```
+
+```{r}
+CLUSTL_sig <- CLUSTL[CLUSTL$adj_p_value < 0.05, ]
+```
+
+```{r}
+nb_sig_genes <- mutation_counts_filtered %>%
+  filter(selection_status == "Positive" & adj_p_value < 0.05) %>%
+  pull(Hugo_Symbol) %>%
+  unique()
+
+bi_dnds_positive_genes <- mutation_counts_filtered %>%
+  filter(dnds_selection == "Positive" & dnds_adj_p_value < 0.05) %>%
+  pull(Hugo_Symbol) %>%
+  unique()
+
+dndscv_significant_genes <- STAD_sel_cv %>%
+  filter(qallsubs_cv < 0.05) %>%
+  pull(gene_name) %>%
+  unique()
+
+FML_sig_genes <- FML %>%
+  filter(q_phi_pos < 0.05) %>%
+  pull(gene) %>%
+  unique()
+
+CLUSTL_sig <- CLUSTL %>%
+  filter(adj_p_value < 0.05) %>%
+  pull(SYMBOL) %>%
+  unique()
+
+fill_colors <- c("red", "blue", 'brown', 'purple', 'yellow')
+
+venn_plot <- venn.diagram(
+  x = list(
+    "nb Positive Selection" = nb_sig_genes,
+    "STAD_sel_cv (qallsubs_cv < 0.1)" = dndscv_significant_genes,
+    "binomial dn/ds Positive Selection" = bi_dnds_positive_genes,
+    "FML Positive Selection" = FML_sig_genes,
+    "CLUSTL Clusters" = CLUSTL_sig
+  ),
+  filename = NULL, 
+  fill = fill_colors,
+  # alpha = 0.5,
+  label.col = "black",
+  # cex = 2, 
+  # cat.cex = 1.5,
+  cat.col = fill_colors,
+  margin = 0.1
+)
+grid.draw(venn_plot)
+```
+
+```{r}
+nb_sig_genes <- unique(toupper(nb_sig_genes))
+bi_dnds_positive_genes <- unique(toupper(bi_dnds_positive_genes))
+dndscv_significant_genes <- unique(toupper(dndscv_significant_genes))
+FML_sig_genes <- unique(toupper(FML_sig_genes))
+CLUSTL_sig <- unique(toupper(CLUSTL_sig))
+
+Reduce(intersect, list(
+                       bi_dnds_positive_genes, 
+                       dndscv_significant_genes, 
+                       FML_sig_genes))
+```
+
+```{r}
+nb_sig_genes <- mutation_counts_filtered %>%
+  filter(selection_status == "Positive" & adj_p_value < 0.05) %>%
+  pull(Hugo_Symbol) %>%
+  unique()
+
+bi_dnds_positive_genes <- mutation_counts_filtered %>%
+  filter(dnds_selection == "Positive" & dnds_adj_p_value < 0.05) %>%
+  pull(Hugo_Symbol) %>%
+  unique()
+
+dndscv_significant_genes <- STAD_sel_cv %>%
+  filter(qallsubs_cv < 0.05) %>%
+  pull(gene_name) %>%
+  unique()
+
+FML_sig_genes <- FML %>%
+  filter(q_phi_pos < 0.05) %>%
+  pull(gene) %>%
+  unique()
+
+CLUSTL_sig <- CLUSTL %>%
+  filter(adj_p_value < 0.05) %>%
+  pull(SYMBOL) %>%
+  unique()
+
+fill_colors <- c("red", "blue", 'brown')
+
+venn_plot <- venn.diagram(
+  x = list(
+    "nb Positive Selection" = nb_sig_genes,
+    "STAD_sel_cv (qallsubs_cv < 0.1)" = dndscv_significant_genes,
+    # "binomial dn/ds Positive Selection" = bi_dnds_positive_genes,
+    "FML Positive Selection" = FML_sig_genes
+    # "CLUSTL Clusters" = CLUSTL_sig
+  ),
+  filename = NULL, 
+  fill = fill_colors,
+  # alpha = 0.5,
+  label.col = "black",
+  # cex = 2, 
+  # cat.cex = 1.5,
+  cat.col = fill_colors,
+  margin = 0.1
+)
+grid.draw(venn_plot)
+```
+
+```{r}
+nb_sig_genes <- unique(toupper(nb_sig_genes))
+bi_dnds_positive_genes <- unique(toupper(bi_dnds_positive_genes))
+dndscv_significant_genes <- unique(toupper(dndscv_significant_genes))
+FML_sig_genes <- unique(toupper(FML_sig_genes))
+CLUSTL_sig <- unique(toupper(CLUSTL_sig))
+
+Reduce(intersect, list(nb_sig_genes,
+                       # bi_dnds_positive_genes, 
+                       dndscv_significant_genes, 
+                       FML_sig_genes))
+```
+
+```{r}
+colnames(mutation_counts_filtered)
+```
+
+```{r}
+mutation_counts_filtered[(mutation_counts_filtered$p_value < 0.05) & (mutation_counts_filtered$Hugo_Symbol == "ARID1A"),]
+
+
+```
+
